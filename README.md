@@ -144,3 +144,11 @@ launchctl unload ~/Library/LaunchAgents/com.yourname.dictation.plist
 
 **Text pastes in wrong app**
 - Release the key slowly — there is a small delay before paste fires
+
+**Python keeps appearing in the Dock**
+- This happens when macOS treats the host interpreter as a normal foreground app instead of a menu bar accessory
+- The current `dictation.py` overrides `rumps` startup to force accessory mode so only the menu bar icon stays visible
+
+**Quit from the menu bar just reopens**
+- If your LaunchAgent plist uses `<key>KeepAlive</key><true/>`, launchd will restart the app after it exits
+- Remove `KeepAlive` if you want Quit to stop the app until the next manual launch or login

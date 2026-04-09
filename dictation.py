@@ -16,7 +16,9 @@ import rumps
 import sounddevice as sd
 import whisper
 import Quartz
+from AppKit import NSApplicationActivationPolicyAccessory
 from pynput import mouse
+from rumps import rumps as rumps_runtime
 
 # ── Config ────────────────────────────────────────────────────────────────────
 WHISPER_MODEL_DIR = Path.home() / "App Dev" / "whisper-models"
@@ -24,6 +26,7 @@ MODEL_SIZE = "small"
 SAMPLE_RATE = 16000
 MIN_DURATION_SEC = 0.5
 LOG_FILE = Path(__file__).parent / "dictation.log"
+WARMUP_AUDIO_SEC = 1.0
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,6 +40,34 @@ log = logging.getLogger(__name__)
 class DictationApp(rumps.App):
     def __init__(self):
         super().__init__("🎤", quit_button="Quit Dictation")
+
+    # rumps activates the host app as a normal foreground app by default,
+    # which makes macOS surface Python.app in the Dock. Run as an accessory
+    # app instead so only the menu bar item is visible.
+    def run(self, **options):
+        dont_change = object()
+        debug = options.get("debug", dont_change)
+        if debug is not dont_change:
+            rumps.debug_mode(debug)
+
+        nsapplication = rumps_runtime.NSApplication.sharedApplication()
+        nsapplication.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        self._nsapp = rumps_runtime.NSApp.alloc().init()
+        self._nsapp._app = self.__dict__
+        nsapplication.setDelegate_(self._nsapp)
+        rumps_runtime.notifications._init_nsapp(self._nsapp)
+
+        setattr(rumps.App, "*app_instance", self)
+        for timer_obj in getattr(rumps_runtime.timer, "*timers", []):
+            timer_obj.start()
+        for button_callback in getattr(rumps_runtime.clicked, "*buttons", []):
+            button_callback(self)
+
+        self._nsapp.initializeStatusBar()
+        nsapplication.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+        rumps_runtime.AppHelper.installMachInterrupt()
+        rumps_runtime.events.before_start.emit()
+        rumps_runtime.AppHelper.runEventLoop()
 
     def set_idle(self):
         self.title = "🎤"
@@ -59,24 +90,43 @@ log.info("Model ready.")
 _recording = False
 _audio_chunks: list[np.ndarray] = []
 _lock = threading.Lock()
+_transcription_lock = threading.Lock()
 
 
 # ── Audio ─────────────────────────────────────────────────────────────────────
 def _audio_callback(indata, frames, time_info, status):
-    if _recording:
-        _audio_chunks.append(indata.copy())
+    if status:
+        log.warning("Audio callback status: %s", status)
+
+    with _lock:
+        if _recording:
+            _audio_chunks.append(indata.copy())
+
+
+def _set_menu_state(state_setter):
+    rumps_runtime.AppHelper.callAfter(state_setter)
 
 
 # ── Text output via clipboard paste ───────────────────────────────────────────
 def _paste_text(text: str):
     original = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
-    proc = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-    proc.communicate(text.encode("utf-8"))
-    time.sleep(0.05)
-    pyautogui.hotkey("command", "v")
-    time.sleep(0.1)
-    proc2 = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
-    proc2.communicate(original.encode("utf-8"))
+    try:
+        subprocess.run(["pbcopy"], input=text, text=True, check=True)
+        time.sleep(0.05)
+        pyautogui.hotkey("command", "v")
+        time.sleep(0.1)
+    finally:
+        subprocess.run(["pbcopy"], input=original, text=True, check=False)
+
+
+def _warm_up_model():
+    try:
+        silence = np.zeros(int(SAMPLE_RATE * WARMUP_AUDIO_SEC), dtype=np.float32)
+        with _transcription_lock:
+            model.transcribe(silence, language="en", fp16=False)
+        log.info("Warmup transcription complete.")
+    except Exception:
+        log.exception("Warmup transcription failed.")
 
 
 # ── Transcription ─────────────────────────────────────────────────────────────
@@ -85,29 +135,32 @@ def _transcribe_and_type():
         chunks = list(_audio_chunks)
 
     if not chunks:
-        app.set_idle()
+        _set_menu_state(app.set_idle)
         return
 
-    audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
-    duration = len(audio) / SAMPLE_RATE
+    try:
+        audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
+        duration = len(audio) / SAMPLE_RATE
 
-    if duration < MIN_DURATION_SEC:
-        log.info("Clip too short (%.2fs), skipping.", duration)
-        app.set_idle()
-        return
+        if duration < MIN_DURATION_SEC:
+            log.info("Clip too short (%.2fs), skipping.", duration)
+            return
 
-    app.set_transcribing()
-    log.info("Transcribing %.1fs of audio...", duration)
-    result = model.transcribe(audio, language="en", fp16=False)
-    text = result["text"].strip()
+        _set_menu_state(app.set_transcribing)
+        log.info("Transcribing %.1fs of audio...", duration)
+        with _transcription_lock:
+            result = model.transcribe(audio, language="en", fp16=False)
+        text = result["text"].strip()
 
-    if text:
-        log.info("Result: %s", text)
-        _paste_text(text)
-    else:
-        log.info("No speech detected.")
-
-    app.set_idle()
+        if text:
+            log.info("Result: %s", text)
+            _paste_text(text)
+        else:
+            log.info("No speech detected.")
+    except Exception:
+        log.exception("Transcription failed.")
+    finally:
+        _set_menu_state(app.set_idle)
 
 
 # ── Shared start/stop ─────────────────────────────────────────────────────────
@@ -119,7 +172,7 @@ def _start_recording():
         _recording = True
         _audio_chunks = []
     log.info("Recording started.")
-    app.set_recording()
+    _set_menu_state(app.set_recording)
 
 
 def _stop_recording():
@@ -138,6 +191,14 @@ _fn_pressed = False
 
 def _quartz_callback(proxy, event_type, event, refcon):
     global _fn_pressed
+    if event_type in (
+        Quartz.kCGEventTapDisabledByTimeout,
+        Quartz.kCGEventTapDisabledByUserInput,
+    ):
+        Quartz.CGEventTapEnable(proxy, True)
+        log.info("Re-enabled fn key event tap after macOS disabled it.")
+        return event
+
     if event_type == Quartz.kCGEventFlagsChanged:
         flags = Quartz.CGEventGetFlags(event)
         fn_down = bool(flags & FN_FLAG)
@@ -184,13 +245,10 @@ if __name__ == "__main__":
     log.info("Whisper Dictation started. Hold fn or middle mouse to dictate.")
 
     threading.Thread(target=_start_fn_listener, daemon=True).start()
+    threading.Thread(target=_warm_up_model, daemon=True).start()
 
     mouse_listener = mouse.Listener(on_click=on_mouse_click)
     mouse_listener.start()
-
-    # Hide from Dock — menu bar only
-    import AppKit
-    AppKit.NSApp.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,
