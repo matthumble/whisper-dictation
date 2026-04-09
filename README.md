@@ -4,7 +4,7 @@ A lightweight macOS dictation tool that uses OpenAI Whisper to transcribe your v
 
 - **Hold fn** or **middle mouse button** to record
 - **Release** to transcribe and type
-- Menu bar icon shows status: 🎤 idle · 🔴 recording · ⏳ transcribing
+- Menu bar icon shows status: 🎤 idle · 🔴 recording · ⏳ transcribing · 📞 external transcription running
 
 ---
 
@@ -103,6 +103,9 @@ All settings are at the top of `dictation.py`:
 | `WHISPER_MODEL_DIR` | `~/whisper-models` | Path to Whisper model files |
 | `MODEL_SIZE` | `small` | Whisper model: `tiny`, `base`, `small`, `medium`, `large`, `turbo` |
 | `MIN_DURATION_SEC` | `0.5` | Ignore clips shorter than this (seconds) |
+| `EXTERNAL_TRANSCRIPTION_PATTERNS` | `whisper`, `macwhisper`, `transcribe`, etc. | Process-name matches that make dictation show 📞 and ignore new recording starts |
+
+When 📞 appears, dictation is intentionally unavailable because another Whisper-style transcription process appears to be running. This avoids competing with your larger call-transcription model for local compute.
 
 ### Changing the hotkey
 
