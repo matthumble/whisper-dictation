@@ -1,0 +1,6 @@
+openai-whisper
+sounddevice
+numpy
+pyautogui
+pynput
+pyobjc-framework-Quartz

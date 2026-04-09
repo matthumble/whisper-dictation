@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.dictation</string>
+    <key>ProgramArguments</key>
+    <array>
+        <!-- Update this path to your project's .venv Python binary -->
+        <string>/Users/YOUR_USERNAME/whisper-dictation/.venv/bin/python3</string>
+        <!-- Update this path to your dictation.py location -->
+        <string>/Users/YOUR_USERNAME/whisper-dictation/dictation.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/whisper-dictation/dictation.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/whisper-dictation/dictation_error.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
