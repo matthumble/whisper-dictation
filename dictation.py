@@ -89,6 +89,7 @@ log.info("Model ready.")
 # ── State ─────────────────────────────────────────────────────────────────────
 _recording = False
 _audio_chunks: list[np.ndarray] = []
+_audio_stream: sd.InputStream | None = None
 _lock = threading.Lock()
 _transcription_lock = threading.Lock()
 
@@ -135,6 +136,7 @@ def _transcribe_and_type():
         chunks = list(_audio_chunks)
 
     if not chunks:
+        log.info("No audio captured, skipping transcription.")
         _set_menu_state(app.set_idle)
         return
 
@@ -165,22 +167,57 @@ def _transcribe_and_type():
 
 # ── Shared start/stop ─────────────────────────────────────────────────────────
 def _start_recording():
-    global _recording, _audio_chunks
+    global _recording, _audio_chunks, _audio_stream
     with _lock:
         if _recording:
             return
         _recording = True
         _audio_chunks = []
+
+    try:
+        stream = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype="float32",
+            callback=_audio_callback,
+        )
+        stream.start()
+    except Exception:
+        with _lock:
+            _recording = False
+            _audio_stream = None
+        log.exception("Could not start audio input stream.")
+        _set_menu_state(app.set_idle)
+        return
+
+    with _lock:
+        if not _recording:
+            stream.close()
+            return
+        _audio_stream = stream
+
     log.info("Recording started.")
     _set_menu_state(app.set_recording)
 
 
 def _stop_recording():
-    global _recording
+    global _recording, _audio_stream
     with _lock:
         if not _recording:
             return
         _recording = False
+        stream = _audio_stream
+        _audio_stream = None
+        chunk_count = len(_audio_chunks)
+
+    if stream:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            log.exception("Could not stop audio input stream cleanly.")
+
+    log.info("Recording stopped. Captured %d audio chunks.", chunk_count)
     threading.Thread(target=_transcribe_and_type, daemon=True).start()
 
 
@@ -250,10 +287,4 @@ if __name__ == "__main__":
     mouse_listener = mouse.Listener(on_click=on_mouse_click)
     mouse_listener.start()
 
-    with sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=1,
-        dtype="float32",
-        callback=_audio_callback,
-    ):
-        app.run()  # rumps takes over the main thread (required for macOS UI)
+    app.run()  # rumps takes over the main thread (required for macOS UI)
