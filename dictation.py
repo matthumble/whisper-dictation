@@ -6,6 +6,7 @@ Menu bar icon shows current state: 🎤 idle, 🔴 recording, ⏳ transcribing.
 """
 import logging
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -103,6 +104,7 @@ log.info("Model ready.")
 _recording = False
 _audio_chunks: list[np.ndarray] = []
 _audio_stream: sd.InputStream | None = None
+_audio_sample_rate = float(SAMPLE_RATE)
 _external_transcription_active = False
 _external_transcription_command: str | None = None
 _local_transcription_active = False
@@ -139,7 +141,25 @@ def _is_external_transcription_command(command: str) -> bool:
     script_path = str(Path(__file__).resolve()).lower()
     if str(os.getpid()) in normalized or "dictation.py" in normalized or script_path in normalized:
         return False
-    return any(pattern in normalized for pattern in EXTERNAL_TRANSCRIPTION_PATTERNS)
+
+    try:
+        tokens = shlex.split(normalized)
+    except ValueError:
+        tokens = normalized.split()
+
+    basenames = {Path(token).name for token in tokens}
+    joined_tokens = " ".join(tokens)
+
+    if {"macwhisper", "mlx_whisper", "faster_whisper"} & basenames:
+        return True
+    if "whisper" in basenames:
+        return True
+    if "sales_agent.transcription" in joined_tokens:
+        return True
+    if any(f"-m {pattern}" in joined_tokens for pattern in ("transcription", "transcribe")):
+        return True
+
+    return False
 
 
 def _detect_external_transcription() -> tuple[bool, str | None]:
@@ -193,6 +213,75 @@ def _monitor_external_transcription():
         time.sleep(EXTERNAL_TRANSCRIPTION_POLL_SEC)
 
 
+def _resample_audio(audio: np.ndarray, source_sample_rate: float, target_sample_rate: int) -> np.ndarray:
+    if not audio.size or int(source_sample_rate) == int(target_sample_rate):
+        return audio.astype(np.float32, copy=False)
+
+    duration = len(audio) / source_sample_rate
+    target_length = max(1, int(round(duration * target_sample_rate)))
+    source_positions = np.linspace(0, len(audio) - 1, num=len(audio), dtype=np.float64)
+    target_positions = np.linspace(0, len(audio) - 1, num=target_length, dtype=np.float64)
+    resampled = np.interp(target_positions, source_positions, audio)
+    return resampled.astype(np.float32, copy=False)
+
+
+def _candidate_input_stream_configs() -> list[tuple[int | None, float, str]]:
+    candidates: list[tuple[int | None, float, str]] = []
+    seen: set[tuple[int | None, int]] = set()
+    default_input_device = sd.default.device[0]
+    devices = sd.query_devices()
+
+    def add_candidate(device_id: int | None, sample_rate: float, label: str):
+        key = (device_id, int(round(sample_rate)))
+        if sample_rate <= 0 or key in seen:
+            return
+        seen.add(key)
+        candidates.append((device_id, float(sample_rate), label))
+
+    if default_input_device is not None and default_input_device >= 0:
+        device_info = devices[default_input_device]
+        add_candidate(
+            default_input_device,
+            float(device_info["default_samplerate"]),
+            f"default input {device_info['name']}",
+        )
+        add_candidate(default_input_device, SAMPLE_RATE, f"default input {device_info['name']}")
+
+    for fallback_rate in (48000, 44100):
+        add_candidate(default_input_device, fallback_rate, "default input fallback")
+
+    for device_id, device_info in enumerate(devices):
+        if not device_info["max_input_channels"]:
+            continue
+        add_candidate(
+            device_id,
+            float(device_info["default_samplerate"]),
+            f"fallback input {device_info['name']}",
+        )
+
+    return candidates
+
+
+def _open_audio_input_stream() -> tuple[sd.InputStream, float]:
+    failures: list[str] = []
+    for device_id, sample_rate, label in _candidate_input_stream_configs():
+        try:
+            stream = sd.InputStream(
+                device=device_id,
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                callback=_audio_callback,
+            )
+            stream.start()
+            log.info("Opened audio input using %s at %.0f Hz.", label, sample_rate)
+            return stream, sample_rate
+        except Exception as exc:
+            failures.append(f"{label} @ {sample_rate:.0f} Hz: {exc}")
+
+    raise RuntimeError(" ; ".join(failures) if failures else "No input devices available")
+
+
 # ── Text output via clipboard paste ───────────────────────────────────────────
 def _paste_text(text: str):
     original = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
@@ -217,8 +306,10 @@ def _warm_up_model():
 
 # ── Transcription ─────────────────────────────────────────────────────────────
 def _transcribe_and_type():
+    global _local_transcription_active
     with _lock:
         chunks = list(_audio_chunks)
+        capture_sample_rate = _audio_sample_rate
 
     if not chunks:
         log.info("No audio captured, skipping transcription.")
@@ -227,17 +318,17 @@ def _transcribe_and_type():
 
     try:
         audio = np.concatenate(chunks, axis=0).flatten().astype(np.float32)
-        duration = len(audio) / SAMPLE_RATE
+        duration = len(audio) / capture_sample_rate
 
         if duration < MIN_DURATION_SEC:
             log.info("Clip too short (%.2fs), skipping.", duration)
             return
 
-        global _local_transcription_active
         with _lock:
             _local_transcription_active = True
         _set_menu_state(app.set_transcribing)
         log.info("Transcribing %.1fs of audio...", duration)
+        audio = _resample_audio(audio, capture_sample_rate, SAMPLE_RATE)
         with _transcription_lock:
             result = model.transcribe(audio, language="en", fp16=False)
         text = result["text"].strip()
@@ -257,7 +348,7 @@ def _transcribe_and_type():
 
 # ── Shared start/stop ─────────────────────────────────────────────────────────
 def _start_recording():
-    global _recording, _audio_chunks, _audio_stream
+    global _recording, _audio_chunks, _audio_stream, _audio_sample_rate
     try:
         external_active, command = _detect_external_transcription()
         _set_external_transcription_status(external_active, command)
@@ -277,19 +368,15 @@ def _start_recording():
             return
         _recording = True
         _audio_chunks = []
+        _audio_sample_rate = float(SAMPLE_RATE)
 
     try:
-        stream = sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="float32",
-            callback=_audio_callback,
-        )
-        stream.start()
+        stream, capture_sample_rate = _open_audio_input_stream()
     except Exception:
         with _lock:
             _recording = False
             _audio_stream = None
+            _audio_sample_rate = float(SAMPLE_RATE)
         log.exception("Could not start audio input stream.")
         _set_idle_or_external_transcription()
         return
@@ -299,13 +386,14 @@ def _start_recording():
             stream.close()
             return
         _audio_stream = stream
+        _audio_sample_rate = capture_sample_rate
 
-    log.info("Recording started.")
+    log.info("Recording started at %.0f Hz.", capture_sample_rate)
     _set_menu_state(app.set_recording)
 
 
 def _stop_recording():
-    global _recording, _audio_stream
+    global _recording, _audio_stream, _audio_sample_rate
     with _lock:
         if not _recording:
             return
@@ -313,6 +401,7 @@ def _stop_recording():
         stream = _audio_stream
         _audio_stream = None
         chunk_count = len(_audio_chunks)
+        capture_sample_rate = _audio_sample_rate
 
     if stream:
         try:
@@ -321,7 +410,11 @@ def _stop_recording():
         except Exception:
             log.exception("Could not stop audio input stream cleanly.")
 
-    log.info("Recording stopped. Captured %d audio chunks.", chunk_count)
+    log.info(
+        "Recording stopped. Captured %d audio chunks at %.0f Hz.",
+        chunk_count,
+        capture_sample_rate,
+    )
     threading.Thread(target=_transcribe_and_type, daemon=True).start()
 
 
