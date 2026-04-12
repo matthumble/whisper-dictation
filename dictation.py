@@ -8,6 +8,7 @@ import logging
 import os
 import shlex
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ EXTERNAL_TRANSCRIPTION_PATTERNS = (
     "transcribe",
     "transcription",
 )
+LAUNCH_AGENT_LABEL = "com.builderclarity.dictation"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -91,6 +93,9 @@ class DictationApp(rumps.App):
 
     def set_external_transcription(self):
         self.title = "📞"
+
+    def set_restarting(self):
+        self.title = "↻"
 
 
 app = DictationApp()
@@ -211,6 +216,42 @@ def _monitor_external_transcription():
         except Exception:
             log.exception("Could not check for external transcription processes.")
         time.sleep(EXTERNAL_TRANSCRIPTION_POLL_SEC)
+
+
+def _restart_process():
+    log.info("Restarting Whisper Dictation process.")
+    _set_menu_state(app.set_restarting)
+    time.sleep(0.15)
+
+    launch_label = os.environ.get("LAUNCH_JOB_LABEL", LAUNCH_AGENT_LABEL)
+    launchctl_target = f"gui/{os.getuid()}/{launch_label}"
+
+    try:
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", launchctl_target],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        log.info("Requested launchd restart for %s.", launchctl_target)
+        return
+    except Exception:
+        log.exception("Launchd restart failed, falling back to manual relaunch.")
+
+    try:
+        subprocess.Popen(
+            [sys.executable, *sys.argv],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        log.info("Spawned replacement dictation process.")
+    except Exception:
+        log.exception("Manual relaunch failed.")
+        _set_idle_or_external_transcription()
+        return
+
+    rumps_runtime.AppHelper.callAfter(rumps.quit_application)
 
 
 def _resample_audio(audio: np.ndarray, source_sample_rate: float, target_sample_rate: int) -> np.ndarray:
@@ -472,6 +513,11 @@ def on_mouse_click(x, y, button, pressed):
             _start_recording()
         else:
             _stop_recording()
+
+
+@rumps.clicked("Restart Dictation")
+def restart_dictation(_sender):
+    threading.Thread(target=_restart_process, daemon=True).start()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────

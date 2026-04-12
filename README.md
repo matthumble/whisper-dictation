@@ -123,6 +123,8 @@ The fn key is hardcoded via Quartz. To disable it entirely, remove the `_start_f
 
 Click **🎤** in the menu bar and select **Quit Dictation**.
 
+If dictation stops responding but the menu bar icon is still present, use **Restart Dictation** from the same menu to reload the background process without opening Terminal.
+
 If running as a launchd service it will restart automatically (by design). To stop it permanently:
 
 ```bash
