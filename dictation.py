@@ -31,6 +31,10 @@ MIN_DURATION_SEC = 0.5
 LOG_FILE = Path(__file__).parent / "dictation.log"
 WARMUP_AUDIO_SEC = 1.0
 EXTERNAL_TRANSCRIPTION_POLL_SEC = 2.0
+PASTE_SHORT_DELAY_SEC = 0.05
+PASTE_RESTORE_DELAY_SEC = 0.1
+CLAUDE_PASTE_DELAY_SEC = 0.2
+RECORDING_STATE_POLL_SEC = 0.2
 EXTERNAL_TRANSCRIPTION_PATTERNS = (
     "whisper",
     "macwhisper",
@@ -110,9 +114,11 @@ _recording = False
 _audio_chunks: list[np.ndarray] = []
 _audio_stream: sd.InputStream | None = None
 _audio_sample_rate = float(SAMPLE_RATE)
+_recording_started_at = 0.0
 _external_transcription_active = False
 _external_transcription_command: str | None = None
 _local_transcription_active = False
+_last_dictation_text = ""
 _lock = threading.Lock()
 _transcription_lock = threading.Lock()
 
@@ -129,6 +135,24 @@ def _audio_callback(indata, frames, time_info, status):
 
 def _set_menu_state(state_setter):
     rumps_runtime.AppHelper.callAfter(state_setter)
+
+
+def _load_last_dictation_from_log() -> str:
+    if not LOG_FILE.exists():
+        return ""
+
+    try:
+        for line in reversed(LOG_FILE.read_text().splitlines()):
+            marker = "Result: "
+            if marker in line:
+                return line.split(marker, 1)[1].strip()
+    except Exception:
+        log.exception("Could not restore last dictation from log.")
+
+    return ""
+
+
+_last_dictation_text = _load_last_dictation_from_log()
 
 
 def _set_idle_or_external_transcription():
@@ -216,6 +240,29 @@ def _monitor_external_transcription():
         except Exception:
             log.exception("Could not check for external transcription processes.")
         time.sleep(EXTERNAL_TRANSCRIPTION_POLL_SEC)
+
+
+def _monitor_recording_state():
+    while True:
+        try:
+            with _lock:
+                is_recording = _recording
+                fn_pressed = _fn_pressed
+                started_at = _recording_started_at
+
+            if is_recording and fn_pressed:
+                flags = Quartz.CGEventSourceFlagsState(Quartz.kCGEventSourceStateHIDSystemState)
+                fn_down = bool(flags & FN_FLAG)
+                if not fn_down:
+                    log.info(
+                        "Fn release event appears to have been missed; force-stopping recording after %.1fs.",
+                        max(0.0, time.time() - started_at),
+                    )
+                    _stop_recording()
+        except Exception:
+            log.exception("Could not reconcile recording state.")
+
+        time.sleep(RECORDING_STATE_POLL_SEC)
 
 
 def _restart_process():
@@ -324,13 +371,59 @@ def _open_audio_input_stream() -> tuple[sd.InputStream, float]:
 
 
 # ── Text output via clipboard paste ───────────────────────────────────────────
+def _frontmost_app_name() -> str | None:
+    try:
+        result = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "System Events" to get name of first application process whose frontmost is true',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or None
+    except Exception:
+        log.exception("Could not determine frontmost application.")
+        return None
+
+
+def _send_paste_shortcut() -> bool:
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "System Events" to keystroke "v" using command down',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return True
+    except Exception:
+        log.exception("AppleScript paste failed, falling back to pyautogui hotkey.")
+        pyautogui.hotkey("command", "v")
+        return False
+
+
+def _copy_text_to_clipboard(text: str):
+    subprocess.run(["pbcopy"], input=text, text=True, check=True)
+
+
 def _paste_text(text: str):
     original = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout
     try:
-        subprocess.run(["pbcopy"], input=text, text=True, check=True)
-        time.sleep(0.05)
-        pyautogui.hotkey("command", "v")
-        time.sleep(0.1)
+        _copy_text_to_clipboard(text)
+        frontmost_app = _frontmost_app_name()
+        log.info("Pasting into frontmost app: %s", frontmost_app or "unknown")
+        if frontmost_app == "Claude":
+            time.sleep(CLAUDE_PASTE_DELAY_SEC)
+        else:
+            time.sleep(PASTE_SHORT_DELAY_SEC)
+        _send_paste_shortcut()
+        time.sleep(PASTE_RESTORE_DELAY_SEC)
     finally:
         subprocess.run(["pbcopy"], input=original, text=True, check=False)
 
@@ -347,7 +440,7 @@ def _warm_up_model():
 
 # ── Transcription ─────────────────────────────────────────────────────────────
 def _transcribe_and_type():
-    global _local_transcription_active
+    global _last_dictation_text, _local_transcription_active
     with _lock:
         chunks = list(_audio_chunks)
         capture_sample_rate = _audio_sample_rate
@@ -374,7 +467,10 @@ def _transcribe_and_type():
             result = model.transcribe(audio, language="en", fp16=False)
         text = result["text"].strip()
 
-        if text:
+        if text in {"V", "v"}:
+            log.info("Skipping likely spurious one-letter transcription: %s", text)
+        elif text:
+            _last_dictation_text = text
             log.info("Result: %s", text)
             _paste_text(text)
         else:
@@ -389,7 +485,7 @@ def _transcribe_and_type():
 
 # ── Shared start/stop ─────────────────────────────────────────────────────────
 def _start_recording():
-    global _recording, _audio_chunks, _audio_stream, _audio_sample_rate
+    global _recording, _audio_chunks, _audio_stream, _audio_sample_rate, _recording_started_at
     try:
         external_active, command = _detect_external_transcription()
         _set_external_transcription_status(external_active, command)
@@ -410,6 +506,7 @@ def _start_recording():
         _recording = True
         _audio_chunks = []
         _audio_sample_rate = float(SAMPLE_RATE)
+        _recording_started_at = time.time()
 
     try:
         stream, capture_sample_rate = _open_audio_input_stream()
@@ -434,7 +531,7 @@ def _start_recording():
 
 
 def _stop_recording():
-    global _recording, _audio_stream, _audio_sample_rate
+    global _recording, _audio_stream, _audio_sample_rate, _recording_started_at
     with _lock:
         if not _recording:
             return
@@ -443,6 +540,7 @@ def _stop_recording():
         _audio_stream = None
         chunk_count = len(_audio_chunks)
         capture_sample_rate = _audio_sample_rate
+        _recording_started_at = 0.0
 
     if stream:
         try:
@@ -520,6 +618,19 @@ def restart_dictation(_sender):
     threading.Thread(target=_restart_process, daemon=True).start()
 
 
+@rumps.clicked("Copy Last Dictation")
+def copy_last_dictation(_sender):
+    if not _last_dictation_text:
+        log.info("Copy Last Dictation requested, but no transcript is available yet.")
+        return
+
+    try:
+        _copy_text_to_clipboard(_last_dictation_text)
+        log.info("Copied last dictation to clipboard.")
+    except Exception:
+        log.exception("Could not copy last dictation to clipboard.")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     log.info("Whisper Dictation started. Hold fn or middle mouse to dictate.")
@@ -527,6 +638,7 @@ if __name__ == "__main__":
     threading.Thread(target=_start_fn_listener, daemon=True).start()
     threading.Thread(target=_warm_up_model, daemon=True).start()
     threading.Thread(target=_monitor_external_transcription, daemon=True).start()
+    threading.Thread(target=_monitor_recording_state, daemon=True).start()
 
     mouse_listener = mouse.Listener(on_click=on_mouse_click)
     mouse_listener.start()
