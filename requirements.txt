@@ -1,6 +1,6 @@
-openai-whisper
-sounddevice
-numpy
-pyautogui
-pynput
-pyobjc-framework-Quartz
+openai-whisper==20250625
+mlx-whisper==0.4.3
+sounddevice==0.5.5
+numpy==2.4.4
+rumps==0.4.0
+pyobjc-framework-Quartz==12.1

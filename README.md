@@ -1,6 +1,6 @@
 # Whisper Dictation
 
-A lightweight macOS dictation tool that uses OpenAI Whisper to transcribe your voice and type the result into any app. Runs silently as a menu bar app — no terminal needed.
+A lightweight macOS dictation tool that uses Whisper to transcribe your voice and type the result into any app. On Apple Silicon it uses the MLX Whisper backend by default, with OpenAI Whisper kept as a fallback. Runs silently as a menu bar app — no terminal needed.
 
 - **Hold fn** or **middle mouse button** to record
 - **Release** to transcribe and type
@@ -25,15 +25,19 @@ git clone https://github.com/matthumble/whisper-dictation.git
 cd whisper-dictation
 ```
 
-### 2. Download the Whisper model
+### 2. Prepare the transcription model
 
-The tool uses the `small` Whisper model by default. Create a folder for the model and set the path in `dictation.py`:
+The tool uses the `small` model by default.
+
+On Apple Silicon, the default MLX backend will download the converted model automatically on first run.
+
+The OpenAI Whisper fallback still uses a local model directory:
 
 ```bash
 mkdir -p ~/whisper-models
 ```
 
-The model will download automatically the first time the app runs. To pre-download it manually:
+To pre-download the fallback OpenAI Whisper model manually:
 
 ```bash
 python3 -c "import whisper; whisper.load_model('small', download_root='<path-to-your-models-folder>')"
@@ -92,6 +96,18 @@ To restart after changes:
 launchctl kickstart -k gui/$(id -u)/com.yourname.dictation
 ```
 
+The `Restart Dictation` menu item uses the same `launchctl kickstart` command. By default it targets the label `com.example.dictation`. If you used a different label in your plist, set `LAUNCH_JOB_LABEL` in the plist's `EnvironmentVariables` so the restart action targets the right job:
+
+```xml
+<key>EnvironmentVariables</key>
+<dict>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LAUNCH_JOB_LABEL</key>
+    <string>com.yourname.dictation</string>
+</dict>
+```
+
 ---
 
 ## Configuration
@@ -100,6 +116,8 @@ All settings are at the top of `dictation.py`:
 
 | Setting | Default | Description |
 |---|---|---|
+| `TRANSCRIPTION_BACKEND` | `mlx` | Backend: `mlx` on Apple Silicon, with automatic fallback to OpenAI Whisper if MLX fails |
+| `MLX_MODEL_REPO` | `mlx-community/whisper-small-mlx` | Hugging Face repo for the converted MLX Whisper model |
 | `WHISPER_MODEL_DIR` | `~/whisper-models` | Path to Whisper model files |
 | `MODEL_SIZE` | `small` | Whisper model: `tiny`, `base`, `small`, `medium`, `large`, `turbo` |
 | `MIN_DURATION_SEC` | `0.5` | Ignore clips shorter than this (seconds) |
@@ -109,13 +127,11 @@ When 📞 appears, dictation is intentionally unavailable because another Whispe
 
 ### Changing the hotkey
 
-By default the tool uses **fn** and **middle mouse**. To change the mouse button, update `on_mouse_click`:
+By default the tool uses **fn** and the physical **middle mouse button**. Middle-click is captured with Quartz and swallowed before it reaches the focused app, so it should not move the text cursor while starting dictation.
 
-```python
-if button == mouse.Button.middle:  # change to .left, .right, etc.
-```
+For an MX Master mouse, map the wheel click to the normal middle button action. Do not map it to a keyboard shortcut unless you also change the trigger code.
 
-The fn key is hardcoded via Quartz. To disable it entirely, remove the `_start_fn_listener` thread from `__main__`.
+The fn key is hardcoded via Quartz. To disable it entirely, remove the fn handling from `_quartz_callback`.
 
 ---
 
@@ -142,10 +158,12 @@ launchctl unload ~/Library/LaunchAgents/com.yourname.dictation.plist
 **fn key not working**
 - Make sure Accessibility permission is granted for the correct Python binary
 - Some keyboards remap fn — try reassigning to a different trigger
+- If several fn presses start and stop immediately with no captured audio, check `dictation.log` for repeated `No audio captured`, fallback input selection, or CoreAudio `Invalid Property Value` messages. On April 25, 2026 this cleared after launchd restarted the app and it returned to the MacBook mic. If it recurs, consider adding an automatic restart after several empty recordings in a short window.
 
 **Transcription is slow**
 - Switch to `tiny` or `base` model for faster (less accurate) results
 - The first transcription after startup is slower due to model warmup
+- The first MLX run may also spend extra time downloading the converted model from Hugging Face
 
 **Text pastes in wrong app**
 - Release the key slowly — there is a small delay before paste fires
