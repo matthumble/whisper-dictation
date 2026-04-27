@@ -23,6 +23,10 @@ RECORDING_STATE_POLL_SEC = 0.2
 MAX_RECORDING_DURATION_SEC = 120.0
 EMPTY_RECORDING_WINDOW_SEC = 30.0
 EMPTY_RECORDING_THRESHOLD = 3
+# If sounddevice's stream.stop()/close() hangs longer than this, assume the
+# CoreAudio mutex deadlock and trigger a process restart instead of leaking
+# zombie audio threads forever.
+STREAM_CLOSE_WATCHDOG_SEC = 5.0
 
 # ── External transcription guard ──────────────────────────────────────────────
 EXTERNAL_TRANSCRIPTION_POLL_SEC = 2.0

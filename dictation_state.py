@@ -38,6 +38,7 @@ from dictation_config import (
     RECORDING_STATE_POLL_SEC,
     SAMPLE_RATE,
     SILENCE_RMS_THRESHOLD,
+    STREAM_CLOSE_WATCHDOG_SEC,
 )
 from dictation_menu import call_on_main, start_recording_timer, stop_recording_timer
 from dictation_output import frontmost_app_name
@@ -101,6 +102,10 @@ class Recorder:
         # follow-up dictation in the same app gets a leading space.
         self._last_paste_at = 0.0  # time.monotonic()
         self._last_paste_app: Optional[str] = None
+
+        # Reentrancy guard so a watchdog-triggered restart doesn't fire a
+        # second time while the first is still tearing down the process.
+        self._restart_in_progress = False
 
     # ── Menu state helpers ───────────────────────────────────────────────────
     def set_menu_state(self, state_setter):
@@ -251,7 +256,29 @@ class Recorder:
 
     # ── Restart ──────────────────────────────────────────────────────────────
     def restart(self):
+        with self._lock:
+            if self._restart_in_progress:
+                log.info("Restart already in progress; skipping.")
+                return
+            self._restart_in_progress = True
         self._restart(self)
+
+    # ── Stream close + watchdog ──────────────────────────────────────────────
+    def _close_stream_safely(self, stream):
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            log.exception("Could not stop audio input stream cleanly.")
+
+    def _watchdog_stream_close(self, close_thread):
+        close_thread.join(STREAM_CLOSE_WATCHDOG_SEC)
+        if close_thread.is_alive():
+            log.warning(
+                "Audio stream close hung >%.0fs (CoreAudio deadlock); restarting.",
+                STREAM_CLOSE_WATCHDOG_SEC,
+            )
+            self.restart()
 
     # ── Start / stop ─────────────────────────────────────────────────────────
     def start(self):
@@ -316,15 +343,17 @@ class Recorder:
         if stream:
             # Close on a background thread so a hung stream cannot deadlock the
             # stop path. self.recording=False is already cleared above so the
-            # audio callback drops any in-flight frames during the close.
-            def _close_stream(s):
-                try:
-                    s.stop()
-                    s.close()
-                except Exception:
-                    log.exception("Could not stop audio input stream cleanly.")
-
-            threading.Thread(target=_close_stream, args=(stream,), daemon=True).start()
+            # audio callback drops any in-flight frames during the close. The
+            # watchdog catches the (recurring) CoreAudio mutex deadlock inside
+            # AudioOutputUnitStop and restarts the process instead of leaving
+            # zombie audio threads alive forever.
+            close_thread = threading.Thread(
+                target=self._close_stream_safely, args=(stream,), daemon=True,
+            )
+            close_thread.start()
+            threading.Thread(
+                target=self._watchdog_stream_close, args=(close_thread,), daemon=True,
+            ).start()
 
         log.info(
             "Recording stopped. Captured %d audio chunks at %.0f Hz.",
