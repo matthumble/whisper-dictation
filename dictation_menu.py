@@ -114,9 +114,27 @@ def stop_recording_timer():
         _recording_timer_running[0] = False
 
 
+def _toggle_auto_pause_media(sender):
+    if _recorder is None:
+        return
+    new_state = not bool(sender.state)
+    sender.state = 1 if new_state else 0
+    _recorder.set_auto_pause_media(new_state)
+
+
 def install_menu_callbacks(recorder):
     global _recorder
     _recorder = recorder
+
+    # Toggle for pausing Now Playing media while dictating. Inserted here so
+    # we can seed its checkbox state from the persisted prefs the recorder
+    # already loaded.
+    auto_pause_item = rumps.MenuItem(
+        "Auto-pause Media",
+        callback=_toggle_auto_pause_media,
+    )
+    auto_pause_item.state = 1 if recorder.auto_pause_media else 0
+    app.menu.add(auto_pause_item)
 
 
 @rumps.clicked("Restart Dictation")

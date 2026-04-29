@@ -24,6 +24,8 @@ from typing import Optional
 import numpy as np
 import Quartz
 
+import dictation_media
+import dictation_prefs
 from dictation_audio import open_input_stream, resample_audio
 from dictation_config import (
     AUTO_SPACE_WINDOW_SEC,
@@ -106,6 +108,13 @@ class Recorder:
         # Reentrancy guard so a watchdog-triggered restart doesn't fire a
         # second time while the first is still tearing down the process.
         self._restart_in_progress = False
+
+        # Auto-pause media: persisted toggle. _pause_active_for_current is
+        # latched at start() so a mid-dictation toggle change doesn't leave
+        # us sending Play without a matching Pause (or vice versa).
+        prefs = dictation_prefs.load()
+        self.auto_pause_media: bool = bool(prefs.get("auto_pause_media", False))
+        self._pause_active_for_current = False
 
     # ── Menu state helpers ───────────────────────────────────────────────────
     def set_menu_state(self, state_setter):
@@ -254,6 +263,14 @@ class Recorder:
             self._recent_short_events.clear()
             threading.Thread(target=self.restart, daemon=True).start()
 
+    # ── Preferences ──────────────────────────────────────────────────────────
+    def set_auto_pause_media(self, enabled: bool):
+        self.auto_pause_media = bool(enabled)
+        prefs = dictation_prefs.load()
+        prefs["auto_pause_media"] = self.auto_pause_media
+        dictation_prefs.save(prefs)
+        log.info("auto_pause_media set to %s", self.auto_pause_media)
+
     # ── Restart ──────────────────────────────────────────────────────────────
     def restart(self):
         with self._lock:
@@ -293,6 +310,14 @@ class Recorder:
             log.info("Dictation ignored while external transcription is running.")
             return
 
+        # Probe BEFORE acquiring the recording lock — pmset takes ~30ms and
+        # we don't want to hold the lock that long. This is also why we
+        # check before flipping `recording` to True; a slow pmset call has
+        # zero effect on subsequent recording state.
+        should_pause_media = (
+            self.auto_pause_media and dictation_media.is_media_playing()
+        )
+
         with self._lock:
             if self.external_active:
                 log.info("Dictation ignored while external transcription is running.")
@@ -303,6 +328,12 @@ class Recorder:
             self.audio_chunks = []
             self.audio_sample_rate = float(SAMPLE_RATE)
             self.recording_started_at = time.time()
+            # Latch the pause decision for THIS recording so a mid-dictation
+            # menu toggle or media state change doesn't desync pause/play.
+            self._pause_active_for_current = should_pause_media
+
+        if self._pause_active_for_current:
+            dictation_media.pause()
 
         try:
             stream, capture_sample_rate = open_input_stream(self.audio_callback)
@@ -337,6 +368,11 @@ class Recorder:
             chunk_count = len(self.audio_chunks)
             capture_sample_rate = self.audio_sample_rate
             self.recording_started_at = 0.0
+            should_resume_media = self._pause_active_for_current
+            self._pause_active_for_current = False
+
+        if should_resume_media:
+            dictation_media.play()
 
         call_on_main(stop_recording_timer)
 
